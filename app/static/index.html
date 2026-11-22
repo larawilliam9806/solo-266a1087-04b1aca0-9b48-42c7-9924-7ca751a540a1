@@ -43,12 +43,22 @@
   .nextday { color: var(--red); font-size: 12px; }
   .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 0 24px; }
   code { background: #f1f3f4; padding: 1px 5px; border-radius: 3px; }
+  .pending { color: #b06000; font-weight: 600; }
+  .tag { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px; }
+  .tag.located { background: #e6f4ea; color: var(--green); }
+  .tag.pending { background: #fef7e0; color: #b06000; }
+  .late { color: var(--red); }
+  .early { color: #1a73e8; }
+  .small { font-size: 12px; }
+  textarea { width: 100%; min-height: 120px; font-family: monospace; font-size: 13px;
+             padding: 8px; border: 1px solid var(--border); border-radius: 4px; }
 </style>
 </head>
 <body>
 <header><h1>🚌 公交 GTFS 时刻表发布系统</h1></header>
 <nav>
   <button data-tab="query" class="active">时刻查询</button>
+  <button data-tab="actual">准点核算</button>
   <button data-tab="publish">发布新版本</button>
   <button data-tab="versions">版本记录</button>
 </nav>
@@ -71,6 +81,62 @@
     <button class="primary" id="q-btn">查询</button>
     <span class="muted" id="q-meta"></span>
     <div id="q-result"></div>
+  </div>
+</section>
+
+<!-- ============ 准点核算 ============ -->
+<section id="tab-actual" class="panel">
+  <div class="card">
+    <h2>① 选择运行图、线路、运营日与班次</h2>
+    <div class="grid">
+      <div>
+        <label>运行图版本（仅已发布）</label>
+        <select id="a-version"></select>
+      </div>
+      <div>
+        <label>运营日</label>
+        <input type="date" id="a-date">
+      </div>
+      <div>
+        <label>线路</label>
+        <select id="a-route"></select>
+      </div>
+      <div>
+        <label>当天班次</label>
+        <select id="a-trip"></select>
+      </div>
+    </div>
+    <button class="primary" id="a-load-schedule">载入计划停站</button>
+    <div id="a-schedule"></div>
+  </div>
+
+  <div class="card">
+    <h2>② 上传 / 整份更正实到 CSV</h2>
+    <p class="muted">
+      表头 <code>stop_id,actual_time</code>，每行一个站号与实到时刻；跨午夜沿用 <code>24:00</code> 以上写法，
+      同趟实到时刻不得重复。按实到先后与计划停站对齐：允许跳过未报站、停站序号严格递增、
+      站号须相同、实到与计划到站相差不超过 <b>30 分钟</b>。只把在所有可行对齐中都落到同一停站序号的记录计入统计；
+      无可行对齐时整趟待核。格式错误或保存失败会保留上次记录与核算结果。
+    </p>
+    <label>实到 CSV 文件</label>
+    <input type="file" id="a-file" accept=".csv">
+    <div class="muted small" style="margin-top:8px">或直接粘贴 CSV 文本（与文件二选一，文件优先）：</div>
+    <textarea id="a-text" placeholder="stop_id,actual_time&#10;S1,23:31:00&#10;S3,24:21:00"></textarea>
+    <button class="primary" id="a-upload">保存并核算</button>
+    <div id="a-upload-result"></div>
+  </div>
+
+  <div class="card">
+    <h2>③ 已更正班次与明细
+      <button class="primary" style="margin:0 0 0 10px;padding:4px 12px" id="a-refresh">刷新</button>
+    </h2>
+    <div id="a-uploads"></div>
+  </div>
+
+  <div class="card">
+    <h2>④ 按站准点统计（时差绝对值 ≤ 5 分钟为准点，待核行不计入）</h2>
+    <button class="primary" style="margin:0 0 10px;padding:4px 12px" id="a-stats-btn">统计当前筛选</button>
+    <div id="a-stats"></div>
   </div>
 </section>
 
@@ -115,6 +181,7 @@ document.querySelectorAll("nav button").forEach(btn => {
     $("tab-" + btn.dataset.tab).classList.add("active");
     if (btn.dataset.tab === "versions") loadVersions();
     if (btn.dataset.tab === "query") loadRoutes();
+    if (btn.dataset.tab === "actual") { loadActualVersions().then(loadActualRoutes); }
   };
 });
 
@@ -221,6 +288,163 @@ async function showErrors(vid) {
     ${data.errors.map(e => `<tr><td>${e.file}</td><td>${e.row ?? "-"}</td>
       <td>${e.field ?? "-"}</td><td>${e.message}</td></tr>`).join("")}</table>`;
 }
+
+// ---------- 准点核算 ----------
+$("a-date").value = new Date().toISOString().slice(0, 10);
+
+async function loadActualVersions(keepSel) {
+  const sel = $("a-version");
+  const res = await fetch("/api/versions");
+  const data = await res.json();
+  const published = data.versions.filter(v => v.status === "published");
+  sel.innerHTML = published.map(v =>
+    `<option value="${v.id}"${v.id === data.current_version_id ? " selected" : ""}>v${v.id} ${v.label}</option>`
+  ).join("") || `<option value="">（尚无已发布版本）</option>`;
+  if (keepSel && [...sel.options].some(o => o.value === keepSel)) sel.value = keepSel;
+}
+
+async function loadActualRoutes() {
+  const vid = $("a-version").value;
+  if (!vid) { $("a-route").innerHTML = ""; return; }
+  const res = await fetch(`/api/routes?version_id=${vid}`);
+  const data = await res.json();
+  $("a-route").innerHTML = data.routes.map(r =>
+    `<option value="${r.route_id}">${r.route_short_name || r.route_id} ${r.route_long_name || ""}</option>`).join("");
+}
+
+$("a-version").onchange = loadActualRoutes;
+
+$("a-load-schedule").onclick = async () => {
+  const vid = $("a-version").value, route = $("a-route").value, date = $("a-date").value;
+  const box = $("a-schedule"), tripSel = $("a-trip");
+  tripSel.innerHTML = "";
+  if (!vid || !route || !date) { box.innerHTML = '<div class="banner err">请先选齐版本、运营日和线路</div>'; return; }
+  const res = await fetch(`/api/routes/${encodeURIComponent(route)}/schedule?date=${date}&version_id=${vid}`);
+  const data = await res.json();
+  if (!res.ok) { box.innerHTML = `<div class="banner err">${data.detail || "查询失败"}</div>`; return; }
+  if (!data.trips.length) { box.innerHTML = '<div class="banner err">该运营日此线路没有班次</div>'; return; }
+  tripSel.innerHTML = data.trips.map(t =>
+    `<option value="${t.trip_id}">${t.trip_id}${t.headsign ? " · " + t.headsign : ""}（${t.stop_times.length} 站）</option>`).join("");
+  box.innerHTML = `<p class="muted">共 ${data.trip_count} 个班次，已载入计划停站，可在下方选择班次并上传实到。</p>`;
+};
+
+function fmtDiff(mins) {
+  if (mins === null || mins === undefined) return "-";
+  if (mins === 0) return '<span class="ok">0（准点）</span>';
+  const cls = mins > 0 ? "late" : "early";
+  const sign = mins > 0 ? "+" : "";
+  return `<span class="${cls}">${sign}${mins} 分钟</span>`;
+}
+
+function renderDetail(d) {
+  const banner = d.feasible
+    ? (d.pending_count
+       ? `<div class="banner" style="background:#fef7e0;color:#b06000">存在 ${d.pending_count} 条待核行（在可行对齐中停站序号不唯一），仅 ${d.located_count} 条已定位记录计入统计。</div>`
+       : `<div class="banner ok">全部 ${d.located_count} 条记录已唯一定位，均计入统计。</div>`)
+    : '<div class="banner err">无可行对齐：整趟待核，所有记录均不计入统计。请检查站号、实到时刻与 30 分钟时差窗口。</div>';
+  return banner + `
+    <table>
+      <tr><th>CSV 行</th><th>站号</th><th>实到时刻</th><th>状态</th><th>停站序号</th>
+          <th>时差（实到-计划）</th><th>准点(≤5分)</th><th>待核候选序号</th></tr>
+      ${d.records.map(r => `<tr>
+        <td>${r.csv_row}</td>
+        <td>${r.stop_id}</td>
+        <td>${r.actual_time}</td>
+        <td><span class="tag ${r.status}">${r.status === "located" ? "已定位" : "待核"}</span></td>
+        <td>${r.stop_sequence ?? "-"}</td>
+        <td>${fmtDiff(r.diff_minutes)}</td>
+        <td>${r.on_time === null ? "-" : (r.on_time ? '<span class="ok">准点</span>' : '<span class="bad">晚点/早出</span>')}</td>
+        <td>${r.candidate_sequences ? r.candidate_sequences.join(", ") : "-"}</td>
+      </tr>`).join("")}
+    </table>`;
+}
+
+$("a-upload").onclick = async () => {
+  const vid = $("a-version").value, route = $("a-route").value,
+        date = $("a-date").value, trip = $("a-trip").value;
+  const box = $("a-upload-result");
+  if (!vid || !route || !date || !trip) { box.innerHTML = '<div class="banner err">请先选齐版本/线路/运营日并载入班次</div>'; return; }
+  const f = $("a-file").files[0];
+  const text = $("a-text").value.trim();
+  if (!f && !text) { box.innerHTML = '<div class="banner err">请选择 CSV 文件或粘贴 CSV 文本</div>'; return; }
+  const fd = new FormData();
+  fd.append("version_id", vid); fd.append("route_id", route);
+  fd.append("service_date", date); fd.append("trip_id", trip);
+  if (f) fd.append("file", f);
+  else fd.append("file", new File([text], "actual.csv", { type: "text/csv" }));
+  $("a-upload").disabled = true;
+  try {
+    const res = await fetch("/api/actual-arrivals", { method: "POST", body: fd });
+    const data = await res.json();
+    if (res.ok) {
+      box.innerHTML = `<div class="banner ok">✔ 已保存：版本 v${data.version_id} 班次 ${data.trip_id} · ${data.service_date}
+        （已定位 ${data.located_count} / 待核 ${data.pending_count}）</div>` + renderDetail(data);
+      loadActualUploads();
+    } else if (res.status === 422 && data.detail && data.detail.errors) {
+      const d = data.detail;
+      box.innerHTML = `<div class="banner err">✘ ${d.message || "格式错误，未保存"}，共 ${d.error_count} 个错误，上次记录与核算结果保持不变：</div>
+        <table><tr><th>文件</th><th>行号</th><th>字段</th><th>错误</th></tr>
+        ${d.errors.map(e => `<tr><td>${e.file}</td><td>${e.row ?? "-"}</td>
+          <td>${e.field ?? "-"}</td><td>${e.message}</td></tr>`).join("")}</table>`;
+    } else {
+      box.innerHTML = `<div class="banner err">保存失败（已保留上次记录）：${data.detail || JSON.stringify(data)}</div>`;
+    }
+  } finally {
+    $("a-upload").disabled = false;
+  }
+};
+
+async function loadActualUploads() {
+  const vid = $("a-version").value;
+  const route = $("a-route").value, date = $("a-date").value;
+  const qs = new URLSearchParams();
+  if (vid) qs.set("version_id", vid);
+  if (route) qs.set("route_id", route);
+  if (date) qs.set("service_date", date);
+  const res = await fetch("/api/actual-arrivals?" + qs.toString());
+  const data = await res.json();
+  const box = $("a-uploads");
+  if (!res.ok) { box.innerHTML = `<div class="banner err">${data.detail || "加载失败"}</div>`; return; }
+  if (!data.uploads.length) { box.innerHTML = '<p class="muted">当前筛选下还没有实到更正。</p>'; return; }
+  box.innerHTML = `<table><tr><th>ID</th><th>版本</th><th>班次</th><th>运营日</th><th>可行对齐</th>
+    <th>已定位</th><th>待核</th><th>上传时间</th><th></th></tr>
+    ${data.uploads.map(u => `<tr>
+      <td>#${u.upload_id}</td><td>v${u.version_id}</td><td>${u.trip_id}</td>
+      <td>${u.service_date}</td>
+      <td>${u.feasible ? '<span class="ok">是</span>' : '<span class="bad">否（整趟待核）</span>'}</td>
+      <td>${u.located_count}</td><td>${u.pending_count}</td><td>${u.uploaded_at}</td>
+      <td><a href="#" onclick="showActualDetail(${u.upload_id});return false">查看明细</a></td>
+    </tr>`).join("")}</table><div id="a-detail"></div>`;
+}
+
+async function showActualDetail(id) {
+  const res = await fetch("/api/actual-arrivals/" + id);
+  const d = await res.json();
+  $("a-detail").innerHTML = `<h3>更正 #${id}：v${d.version_id} 班次 ${d.trip_id} · ${d.service_date}</h3>` + renderDetail(d);
+}
+$("a-refresh").onclick = loadActualUploads;
+
+$("a-stats-btn").onclick = async () => {
+  const vid = $("a-version").value;
+  const route = $("a-route").value, date = $("a-date").value;
+  const qs = new URLSearchParams();
+  if (vid) qs.set("version_id", vid);
+  if (route) qs.set("route_id", route);
+  if (date) qs.set("service_date", date);
+  const res = await fetch("/api/actual-arrivals/stats?" + qs.toString());
+  const data = await res.json();
+  const box = $("a-stats");
+  if (!res.ok) { box.innerHTML = `<div class="banner err">${data.detail || "统计失败"}</div>`; return; }
+  if (!data.stops.length) { box.innerHTML = '<p class="muted">暂无已定位记录可统计。</p>'; return; }
+  box.innerHTML = `<p class="muted">计入统计的已定位记录 ${data.total_located} 条，其中准点 ${data.total_on_time} 条；
+      整体准点率 <b>${data.overall_on_time_rate}%</b>（准点阈值 ±5 分钟）。</p>
+    <table><tr><th>站号</th><th>站名</th><th>计入条数</th><th>准点条数</th><th>准点率</th></tr>
+    ${data.stops.map(s => `<tr>
+      <td>${s.stop_id}</td><td>${s.stop_name || "-"}</td>
+      <td>${s.located_count}</td><td>${s.on_time_count}</td>
+      <td><b class="${s.on_time_rate >= 90 ? "ok" : "bad"}">${s.on_time_rate}%</b></td>
+    </tr>`).join("")}</table>`;
+};
 
 loadRoutes();
 </script>

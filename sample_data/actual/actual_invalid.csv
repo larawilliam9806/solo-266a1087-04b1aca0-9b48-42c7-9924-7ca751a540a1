@@ -1,0 +1,4 @@
+stop_id,actual_time
+S1,25:11:00
+S2,25:11:00
+S3,bad-time
